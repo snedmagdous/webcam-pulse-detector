@@ -2,12 +2,9 @@ from lib.device import Camera
 from lib.processors import findFaceGetPulse # Updated import
 from lib.interface import plotXY, imshow, waitKey, destroyWindow
 from cv2 import moveWindow
-import argparse
+import argparse, json, time,datetime, socket, sys
+import paho.mqtt.publish as mqtt
 import numpy as np
-import datetime
-# Serial port code removed
-import socket
-import sys
 from typing import Dict, List, Tuple, Optional, Any, Callable, Union
 
 class getPulseApp:
@@ -24,6 +21,9 @@ class getPulseApp:
         # stream)
         # Serial port code removed
         self.send_udp = False
+        self.mqtt_enabled = args.mqtt is not None
+        self.mqtt_topic = args.mqtt if self.mqtt_enabled else "hr/comparison"
+        self.last_bpm_publish_time = 0
 
         # Setup UDP communication if requested
         udp = args.udp
@@ -156,6 +156,37 @@ class getPulseApp:
             if chr(self.pressed) == key:
                 self.key_controls[key]()
 
+    def publish_bpm(self) -> None:
+        """
+        Publish BPM data to MQTT broker if enabled and valid data exists.
+        """
+        if (self.mqtt_enabled and 
+            hasattr(self.processor, 'bpm') and 
+            self.processor.bpm > 0 and
+            time.time() - self.last_bpm_publish_time > 1.0):  # Throttle to 1 second
+            
+            payload: Dict[str, Any] = {
+                "timestamp": time.time(),
+                "bpm": float(self.processor.bpm),
+                "source": "webcam",
+                "confidence": self.calculate_confidence(),
+                "face_detected": not self.processor.find_faces,
+                "frame_width": self.w,
+                "frame_height": self.h
+            }
+            
+            try:
+                mqtt.single(
+                    self.mqtt_topic,
+                    json.dumps(payload),
+                    hostname="localhost",
+                    port=1883,
+                    keepalive=60
+                )
+                self.last_bpm_publish_time = time.time()
+            except Exception as e:
+                print(f"MQTT publish error: {e}")
+
     def main_loop(self) -> None:
         """
         Single iteration of the application's main loop.
@@ -186,16 +217,34 @@ class getPulseApp:
         if self.send_udp:
             self.sock.sendto(f"{self.processor.bpm}".encode('utf-8'), self.udp)
 
+        # Add this line to publish BPM data via MQTT
+        self.publish_bpm()
+
         # Handle any key presses
         self.key_handler()
+
+def calculate_confidence(self) -> float:
+    """Calculate a confidence score for the current reading"""
+    if not hasattr(self.processor, 'fft') or len(self.processor.fft) == 0:
+        return 0.0
+    
+    # Simple confidence metric based on FFT peak prominence
+    fft = np.array(self.processor.fft)
+    max_val = np.max(fft)
+    mean_val = np.mean(fft)
+    return float((max_val - mean_val) / max_val if max_val > 0 else 0.0)
+
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description='Webcam pulse detector.')
     # Serial port arguments removed
     parser.add_argument('--udp', default=None,
                        help='udp address:port destination for bpm data')
-
+    parser.add_argument('--mqtt', default=None,  # Add this line
+                       help='MQTT topic to publish BPM data to')  
     args = parser.parse_args()
     App = getPulseApp(args)
     while True:
         App.main_loop()
+
+        
